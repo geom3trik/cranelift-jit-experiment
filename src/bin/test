@@ -1,15 +1,16 @@
 
-fn main(a, b) -> (c) {
-    d = foodd(a, b) + foodd(a, b)
-    c = d + b
+fn main(a, b) -> (d) {
+    c = add(a, b)
+    d = one_minus(c)
 }
 
-fn maina(a, b) -> (c) {
-    c = foodd(a, b) + 2.12312 + 1.0
-    c = c + 10.0
-}
-
-fn foodd(a, b) -> (c) {
+// Add
+fn add(a, b) -> (c) {
     c = a + b
+}
+
+// One minus
+fn one_minus(a) -> (c) {
+    c = 1.0 - a
 }
 

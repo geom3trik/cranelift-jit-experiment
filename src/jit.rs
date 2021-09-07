@@ -1,9 +1,12 @@
 use crate::frontend::*;
+use crate::ui::*;
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataContext, Linkage, Module};
 use std::collections::HashMap;
 use std::slice;
+
+use tuix::*;
 
 /// The basic JIT class.
 pub struct JIT {
@@ -39,7 +42,7 @@ impl Default for JIT {
 
 impl JIT {
     /// Compile a string in the toy language into machine code.
-    pub fn compile(&mut self, input: &str) -> Result<*const u8, String> {
+    pub fn compile(&mut self, state: &mut State, node_view: Entity, input: &str) -> Result<*const u8, String> {
         let input = input.replace("\r\n", "\n");
         let prog = parser::program(&input).map_err(|e| e.to_string())?;
 
@@ -50,10 +53,29 @@ impl JIT {
 
         // First, parse the string, producing AST nodes.
         for (name, params, returns, stmts) in prog {
-            ////println!(
-            ////    "name {:?}, params {:?}, the_return {:?}",
-            ////    &name, &params, &the_return
-            ////);
+            println!(
+               "name {:?}, params {:?}, returns {:?}, expressions: {:?}",
+               &name, &params, &returns, &stmts
+            );
+
+            node_view.emit(state, AppEvent::AddNode(NodeDesc {
+                name: name.to_string(),
+                inputs: params.clone(),
+                outputs: returns.clone(),
+            }));
+
+    
+            // Textbox::new("440").build(state, row, |builder| 
+            //     builder
+            //         .set_child_space(Stretch(1.0))
+            //         .set_child_left(Pixels(5.0))
+            //         .set_space(Pixels(0.0))
+            //         .set_background_color(Color::rgb(15, 15, 15))
+            //         .set_right(Pixels(5.0))
+            //         .set_color(Color::white())
+            //         .set_opacity(1.0)
+            // );
+
             //// Then, translate the AST nodes into Cranelift IR.
             self.translate(params, returns, stmts, return_counts.to_owned())?;
             // Next, declare the function to jit. Functions must be declared
@@ -85,6 +107,8 @@ impl JIT {
             // available).
             self.module.finalize_definitions();
         }
+
+        
 
         match self.module.get_name("main") {
             Some(main) => match main {

@@ -12,3 +12,6 @@ cranelift = "0.69.0"
 cranelift-module = "0.69.0"
 cranelift-jit = "0.69.0"
 peg = "0.7"
+tuix = { git = "https://github.com/geom3trik/tuix", branch = "reactive" }
+femtovg = { git = "https://github.com/femtovg/femtovg", branch = "master" }
+daggy = "*"
