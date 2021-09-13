@@ -1,17 +1,37 @@
 [package]
-name = "cranelift-jit-demo"
-version = "0.0.0"
-authors = ["The Cranelift Project Developers"]
-license = "Apache-2.0 WITH LLVM-exception"
-repository = "https://github.com/bytecodealliance/cranelift-jit-demo"
-description = "Toy language implemented using cranelift-jit"
+authors = ["The Sarus Project Developers"]
+description = "A jit engine using cranelift"
 edition = "2018"
+license = "Apache-2.0 WITH LLVM-exception"
+name = "sarus"
+repository = "https://github.com/DGriffin91/sarus/"
+version = "0.0.0"
 
 [dependencies]
-cranelift = "0.69.0"
-cranelift-module = "0.69.0"
-cranelift-jit = "0.69.0"
+anyhow = "1.0.43"
+cranelift = "0.76.0"
+cranelift-jit = "0.76.0"
+cranelift-module = "0.76.0"
+non-empty-vec = "0.2.0"
 peg = "0.7"
 tuix = { git = "https://github.com/geom3trik/tuix", branch = "reactive" }
 femtovg = { git = "https://github.com/femtovg/femtovg", branch = "master" }
 daggy = "*"
+thiserror = "1.0.29"
+
+[dev-dependencies]
+basic-audio-filters = {git = "https://github.com/DGriffin91/rust-basic-audio-filters", branch = "f64"}
+hound = "3.4.0"
+
+
+[[example]]
+name = "run_file"
+
+[[example]]
+name = "run_file_no_validate"
+
+[[example]]
+name = "run_string"
+
+[[example]]
+name = "run_multiple_strings"

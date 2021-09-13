@@ -1,5 +1,6 @@
 use crate::frontend::*;
 use crate::ui::*;
+use cranelift::codegen::ir::immediates::Offset32;
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataContext, Linkage, Module};
@@ -42,42 +43,26 @@ impl Default for JIT {
 
 impl JIT {
     /// Compile a string in the toy language into machine code.
-    pub fn compile(&mut self, state: &mut State, node_view: Entity, input: &str) -> Result<*const u8, String> {
-        let input = input.replace("\r\n", "\n");
-        let prog = parser::program(&input).map_err(|e| e.to_string())?;
-
+    pub fn translate(&mut self, prog: Vec<Declaration>) -> anyhow::Result<()> {
         let mut return_counts = HashMap::new();
-        for (name, _params, returns, _stmts) in &prog {
+        for Declaration { name, returns, .. } in &prog {
             return_counts.insert(name.to_string(), returns.len());
         }
 
         // First, parse the string, producing AST nodes.
-        for (name, params, returns, stmts) in prog {
-            println!(
-               "name {:?}, params {:?}, returns {:?}, expressions: {:?}",
-               &name, &params, &returns, &stmts
-            );
-
-            node_view.emit(state, AppEvent::AddNode(NodeDesc {
-                name: name.to_string(),
-                inputs: params.clone(),
-                outputs: returns.clone(),
-            }));
-
-    
-            // Textbox::new("440").build(state, row, |builder| 
-            //     builder
-            //         .set_child_space(Stretch(1.0))
-            //         .set_child_left(Pixels(5.0))
-            //         .set_space(Pixels(0.0))
-            //         .set_background_color(Color::rgb(15, 15, 15))
-            //         .set_right(Pixels(5.0))
-            //         .set_color(Color::white())
-            //         .set_opacity(1.0)
-            // );
-
+        for Declaration {
+            name,
+            params,
+            returns,
+            body: stmts,
+        } in prog
+        {
+            ////println!(
+            ////    "name {:?}, params {:?}, the_return {:?}",
+            ////    &name, &params, &the_return
+            ////);
             //// Then, translate the AST nodes into Cranelift IR.
-            self.translate(params, returns, stmts, return_counts.to_owned())?;
+            self.codegen(params, returns, stmts, return_counts.to_owned())?;
             // Next, declare the function to jit. Functions must be declared
             // before they can be called, or defined.
             //
@@ -87,7 +72,7 @@ impl JIT {
             let id = self
                 .module
                 .declare_function(&name, Linkage::Export, &self.ctx.func.signature)
-                .map_err(|e| format!("{}:{}:{} {:?}", file!(), line!(), column!(), e))?;
+                .map_err(|e| anyhow::anyhow!("{}:{}:{} {:?}", file!(), line!(), column!(), e))?;
 
             ////println!("ID IS {}", id);
             // Define the function to jit. This finishes compilation, although
@@ -96,8 +81,13 @@ impl JIT {
             // defined. For this toy demo for now, we'll just finalize the
             // function below.
             self.module
-                .define_function(id, &mut self.ctx, &mut codegen::binemit::NullTrapSink {})
-                .map_err(|e| format!("{}:{}:{} {:?}", file!(), line!(), column!(), e))?;
+                .define_function(
+                    id,
+                    &mut self.ctx,
+                    &mut codegen::binemit::NullTrapSink {},
+                    &mut codegen::binemit::NullStackMapSink {},
+                )
+                .map_err(|e| anyhow::anyhow!("{}:{}:{} {:?}", file!(), line!(), column!(), e))?;
 
             // Now that compilation is finished, we can clear out the context state.
             self.module.clear_context(&mut self.ctx);
@@ -108,34 +98,36 @@ impl JIT {
             self.module.finalize_definitions();
         }
 
-        
+        Ok(())
+    }
 
-        match self.module.get_name("main") {
-            Some(main) => match main {
+    pub fn get_func(&mut self, fn_name: &str) -> anyhow::Result<*const u8> {
+        match self.module.get_name(fn_name) {
+            Some(func) => match func {
                 cranelift_module::FuncOrDataId::Func(id) => {
                     Ok(self.module.get_finalized_function(id))
                 }
                 cranelift_module::FuncOrDataId::Data(_) => {
-                    Err("main fn required, data found".to_string())
+                    anyhow::bail!("function {} required, data found", fn_name);
                 }
             },
-            None => Err("No main function found".to_string()),
+            None => anyhow::bail!("No function {} found", fn_name),
         }
     }
 
     /// Create a zero-initialized data section.
-    pub fn create_data(&mut self, name: &str, contents: Vec<u8>) -> Result<&[u8], String> {
+    pub fn create_data(&mut self, name: &str, contents: Vec<u8>) -> anyhow::Result<&[u8]> {
         // The steps here are analogous to `compile`, except that data is much
         // simpler than functions.
         self.data_ctx.define(contents.into_boxed_slice());
         let id = self
             .module
             .declare_data(name, Linkage::Export, true, false)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         self.module
             .define_data(id, &self.data_ctx)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
         self.data_ctx.clear();
         self.module.finalize_definitions();
         let buffer = self.module.get_finalized_data(id);
@@ -144,19 +136,27 @@ impl JIT {
     }
 
     // Translate from toy-language AST nodes into Cranelift IR.
-    fn translate(
+    fn codegen(
         &mut self,
         params: Vec<String>,
         returns: Vec<String>,
         stmts: Vec<Expr>,
         return_counts: HashMap<String, usize>,
-    ) -> Result<(), String> {
+    ) -> anyhow::Result<()> {
         // Our toy language currently only supports I64 values, though Cranelift
         // supports other types.
         let float = types::F64; //self.module.target_config().pointer_type();
 
-        for _p in &params {
-            self.ctx.func.signature.params.push(AbiParam::new(float));
+        for p in &params {
+            if p.starts_with("&") {
+                self.ctx
+                    .func
+                    .signature
+                    .params
+                    .push(AbiParam::new(self.module.target_config().pointer_type()));
+            } else {
+                self.ctx.func.signature.params.push(AbiParam::new(float));
+            }
         }
 
         for _p in &returns {
@@ -185,8 +185,15 @@ impl JIT {
 
         // The toy language allows variables to be declared implicitly.
         // Walk the AST and declare all implicitly-declared variables.
-        let variables =
-            declare_variables(float, &mut builder, &params, &returns, &stmts, entry_block);
+        let variables = declare_variables(
+            float,
+            &mut builder,
+            &mut self.module,
+            &params,
+            &returns,
+            &stmts,
+            entry_block,
+        );
 
         // Now translate the statements of the function body.
         let mut trans = FunctionTranslator {
@@ -196,7 +203,7 @@ impl JIT {
             return_counts,
             module: &mut self.module,
         };
-        for expr in stmts {
+        for expr in &stmts {
             trans.translate_expr(expr);
         }
 
@@ -216,6 +223,35 @@ impl JIT {
 
         // Tell the builder we're done with this function.
         trans.builder.finalize();
+
+        //println!("{}", trans.builder.func.display(None));
+        Ok(())
+    }
+
+    pub fn add_math_constants(&mut self) -> anyhow::Result<()> {
+        let names = [
+            ("E", std::f64::consts::E),
+            ("FRAC_1_PI", std::f64::consts::FRAC_1_PI),
+            ("FRAC_1_SQRT_2", std::f64::consts::FRAC_1_SQRT_2),
+            ("FRAC_2_SQRT_PI", std::f64::consts::FRAC_2_SQRT_PI),
+            ("FRAC_PI_2", std::f64::consts::FRAC_PI_2),
+            ("FRAC_PI_3", std::f64::consts::FRAC_PI_3),
+            ("FRAC_PI_4", std::f64::consts::FRAC_PI_4),
+            ("FRAC_PI_6", std::f64::consts::FRAC_PI_6),
+            ("FRAC_PI_8", std::f64::consts::FRAC_PI_8),
+            ("LN_2", std::f64::consts::LN_2),
+            ("LN_10", std::f64::consts::LN_10),
+            ("LOG2_10", std::f64::consts::LOG2_10),
+            ("LOG2_E", std::f64::consts::LOG2_E),
+            ("LOG10_2", std::f64::consts::LOG10_2),
+            ("LOG10_E", std::f64::consts::LOG10_E),
+            ("PI", std::f64::consts::PI),
+            ("SQRT_2", std::f64::consts::SQRT_2),
+            ("TAU", std::f64::consts::TAU),
+        ];
+        for (name, val) in &names {
+            self.create_data(name, val.to_ne_bytes().to_vec())?;
+        }
         Ok(())
     }
 }
@@ -233,87 +269,86 @@ struct FunctionTranslator<'a> {
 impl<'a> FunctionTranslator<'a> {
     /// When you write out instructions in Cranelift, you get back `Value`s. You
     /// can then use these references in other instructions.
-    fn translate_expr(&mut self, expr: Expr) -> Vec<Value> {
+    fn translate_expr(&mut self, expr: &Expr) -> Vec<Value> {
         match expr {
             Expr::Literal(literal) => {
-                //let imm: i32 = literal.parse().unwrap();
-                let imm: f64 = literal.parse().unwrap();
-                vec![self.builder.ins().f64const(imm as f64)]
+                vec![self.builder.ins().f64const::<f64>(literal.parse().unwrap())]
             }
-
-            Expr::Add(lhs, rhs) => {
-                let lhs = *self.translate_expr(*lhs).first().unwrap();
-                let rhs = *self.translate_expr(*rhs).first().unwrap();
-                vec![self.builder.ins().fadd(lhs, rhs)]
-            }
-
-            Expr::Sub(lhs, rhs) => {
-                let lhs = *self.translate_expr(*lhs).first().unwrap();
-                let rhs = *self.translate_expr(*rhs).first().unwrap();
-                vec![self.builder.ins().fsub(lhs, rhs)]
-            }
-
-            Expr::Mul(lhs, rhs) => {
-                let lhs = *self.translate_expr(*lhs).first().unwrap();
-                let rhs = *self.translate_expr(*rhs).first().unwrap();
-                vec![self.builder.ins().fmul(lhs, rhs)]
-            }
-
-            Expr::Div(lhs, rhs) => {
-                let lhs = *self.translate_expr(*lhs).first().unwrap();
-                let rhs = *self.translate_expr(*rhs).first().unwrap();
-                vec![self.builder.ins().fdiv(lhs, rhs)]
-            }
-
-            Expr::AddAssign(name, expr) => {
-                vec![self
-                    .translate_math_assign(name.to_string(), *expr, &|n, o, b| b.ins().fadd(n, o))]
-            }
-
-            Expr::SubAssign(name, expr) => {
-                vec![self
-                    .translate_math_assign(name.to_string(), *expr, &|n, o, b| b.ins().fsub(n, o))]
-            }
-
-            Expr::MulAssign(name, expr) => {
-                vec![self
-                    .translate_math_assign(name.to_string(), *expr, &|n, o, b| b.ins().fmul(n, o))]
-            }
-
-            Expr::DivAssign(name, expr) => {
-                vec![self
-                    .translate_math_assign(name.to_string(), *expr, &|n, o, b| b.ins().fdiv(n, o))]
-            }
-
-            Expr::Eq(lhs, rhs) => vec![self.translate_icmp(FloatCC::Equal, *lhs, *rhs)],
-            Expr::Ne(lhs, rhs) => vec![self.translate_icmp(FloatCC::NotEqual, *lhs, *rhs)],
-            Expr::Lt(lhs, rhs) => vec![self.translate_icmp(FloatCC::LessThan, *lhs, *rhs)],
-            Expr::Le(lhs, rhs) => vec![self.translate_icmp(FloatCC::LessThanOrEqual, *lhs, *rhs)],
-            Expr::Gt(lhs, rhs) => vec![self.translate_icmp(FloatCC::GreaterThan, *lhs, *rhs)],
-            Expr::Ge(lhs, rhs) => {
-                vec![self.translate_icmp(FloatCC::GreaterThanOrEqual, *lhs, *rhs)]
-            }
+            Expr::Binop(op, lhs, rhs) => self.translate_binop(*op, lhs, rhs),
+            Expr::Compare(cmp, lhs, rhs) => self.translate_cmp(*cmp, lhs, rhs),
             Expr::Call(name, args) => self.translate_call(name, args),
-            Expr::GlobalDataAddr(name) => vec![self.translate_global_data_addr(name)],
+            Expr::GlobalDataAddr(name) => {
+                vec![self
+                    .translate_global_data_addr(self.module.target_config().pointer_type(), name)]
+            }
             Expr::Identifier(name) => {
-                // `use_var` is used to read the value of a variable.
-                let variable = self.variables.get(&name).expect("variable not defined");
-                vec![self.builder.use_var(*variable)]
+                //TODO should this be moved into pattern matching frontend?
+                if name.starts_with("&") {
+                    let var = self
+                        .variables
+                        .get(name)
+                        .copied()
+                        .expect(&format!("variable {} not found", name));
+                    vec![self.builder.use_var(var)]
+                } else {
+                    vec![match self.variables.get(name).copied() {
+                        Some(v) => self.builder.use_var(v),
+                        None => self.translate_global_data_addr(self.float, name), //Try to load global
+                    }]
+                }
             }
             Expr::Assign(names, expr) => self.translate_assign(names, expr),
+            Expr::AssignOp(op, lhs, rhs) => self.translate_math_assign(*op, lhs, rhs),
             Expr::IfThen(condition, then_body) => {
-                vec![self.translate_if_then(*condition, then_body)]
+                vec![self.translate_if_then(condition, then_body)]
             }
             Expr::IfElse(condition, then_body, else_body) => {
-                vec![self.translate_if_else(*condition, then_body, else_body)]
+                self.translate_if_else(condition, then_body, else_body)
             }
             Expr::WhileLoop(condition, loop_body) => {
-                vec![self.translate_while_loop(*condition, loop_body)]
+                vec![self.translate_while_loop(condition, loop_body)]
+            }
+            Expr::Block(b) => {
+                vec![b
+                    .into_iter()
+                    .map(|e| self.translate_expr(e))
+                    .last()
+                    .and_then(|v| v.first().cloned())
+                    .unwrap()]
+            }
+            Expr::Bool(b) => vec![self.builder.ins().bconst(types::B1, *b)],
+            Expr::Parentheses(expr) => self.translate_expr(expr),
+            Expr::ArrayGet(name, idx_expr) => self.translate_array_get(name.to_string(), idx_expr),
+            Expr::ArraySet(name, idx_expr, expr) => {
+                self.translate_array_set(name.to_string(), idx_expr, expr)
             }
         }
     }
 
-    fn translate_assign(&mut self, names: Vec<String>, expr: Vec<Expr>) -> Vec<Value> {
+    fn translate_binop(&mut self, op: Binop, lhs: &Expr, rhs: &Expr) -> Vec<Value> {
+        let lhs = *self.translate_expr(lhs).first().unwrap();
+        let rhs = *self.translate_expr(rhs).first().unwrap();
+        match op {
+            Binop::Add => vec![self.builder.ins().fadd(lhs, rhs)],
+            Binop::Sub => vec![self.builder.ins().fsub(lhs, rhs)],
+            Binop::Mul => vec![self.builder.ins().fmul(lhs, rhs)],
+            Binop::Div => vec![self.builder.ins().fdiv(lhs, rhs)],
+        }
+    }
+
+    fn translate_cmp(&mut self, cmp: Cmp, lhs: &Expr, rhs: &Expr) -> Vec<Value> {
+        let icmp = match cmp {
+            Cmp::Eq => FloatCC::Equal,
+            Cmp::Ne => FloatCC::NotEqual,
+            Cmp::Lt => FloatCC::LessThan,
+            Cmp::Le => FloatCC::LessThanOrEqual,
+            Cmp::Gt => FloatCC::GreaterThan,
+            Cmp::Ge => FloatCC::GreaterThanOrEqual,
+        };
+        vec![self.translate_icmp(icmp, lhs, rhs)]
+    }
+
+    fn translate_assign(&mut self, names: &[String], expr: &[Expr]) -> Vec<Value> {
         // `def_var` is used to write the value of a variable. Note that
         // variables can have multiple definitions. Cranelift will
         // convert them into SSA form for itself automatically.
@@ -325,13 +360,13 @@ impl<'a> FunctionTranslator<'a> {
         if names.len() == expr.len() {
             let mut values = Vec::new();
             for (i, name) in names.iter().enumerate() {
-                values.push(*self.translate_expr(expr[i].clone()).first().unwrap());
+                values.push(*self.translate_expr(expr.get(i).unwrap()).first().unwrap());
                 let variable = self.variables.get(name).unwrap();
                 self.builder.def_var(*variable, *values.last().unwrap());
             }
             values
         } else {
-            let new_value = self.translate_expr(expr.first().unwrap().clone());
+            let new_value = self.translate_expr(expr.first().unwrap());
             for (i, name) in names.iter().enumerate() {
                 let variable = self.variables.get(name).unwrap();
                 self.builder.def_var(*variable, new_value[i]);
@@ -340,36 +375,76 @@ impl<'a> FunctionTranslator<'a> {
         }
     }
 
-    fn translate_math_assign(
-        &mut self,
-        name: String,
-        expr: Expr,
-        f: &dyn Fn(Value, Value, &mut FunctionBuilder) -> Value,
-    ) -> Value {
+    fn translate_array_get(&mut self, name: String, idx_expr: &Expr) -> Vec<Value> {
+        let ptr_ty = self.module.target_config().pointer_type();
+
+        let variable = self.variables.get(&name).unwrap();
+        let array_ptr = self.builder.use_var(*variable);
+
+        let idx_val = self.translate_expr(idx_expr);
+        let idx_val = self
+            .builder
+            .ins()
+            .fcvt_to_uint(ptr_ty, *idx_val.first().unwrap());
+        let mult_n = self.builder.ins().iconst(ptr_ty, types::F64.bytes() as i64);
+        let idx_val = self.builder.ins().imul(mult_n, idx_val);
+        let idx_ptr = self.builder.ins().iadd(idx_val, array_ptr);
+
+        let val =
+            self.builder
+                .ins()
+                .load(types::F64, MemFlags::trusted(), idx_ptr, Offset32::new(0));
+        vec![val]
+    }
+
+    fn translate_array_set(&mut self, name: String, idx_expr: &Expr, expr: &Expr) -> Vec<Value> {
+        let ptr_ty = self.module.target_config().pointer_type();
+
+        let new_val = self.translate_expr(expr);
+
+        let variable = self.variables.get(&name).unwrap();
+        let array_ptr = self.builder.use_var(*variable);
+
+        let idx_val = self.translate_expr(idx_expr);
+        let idx_val = self
+            .builder
+            .ins()
+            .fcvt_to_uint(ptr_ty, *idx_val.first().unwrap());
+        let mult_n = self.builder.ins().iconst(ptr_ty, types::F64.bytes() as i64);
+        let idx_val = self.builder.ins().imul(mult_n, idx_val);
+        let idx_ptr = self.builder.ins().iadd(idx_val, array_ptr);
+
+        self.builder.ins().store(
+            MemFlags::trusted(),
+            *new_val.first().unwrap(),
+            idx_ptr,
+            Offset32::new(0),
+        );
+        vec![]
+    }
+
+    fn translate_math_assign(&mut self, op: Binop, name: &str, expr: &Expr) -> Vec<Value> {
         let new_value = *self.translate_expr(expr).first().unwrap();
         let orig_variable = self.variables.get(&*name).unwrap();
         let orig_value = self.builder.use_var(*orig_variable);
-        let added_val = f(new_value, orig_value, &mut self.builder);
+        let added_val = match op {
+            Binop::Add => self.builder.ins().fadd(orig_value, new_value),
+            Binop::Sub => self.builder.ins().fsub(orig_value, new_value),
+            Binop::Mul => self.builder.ins().fmul(orig_value, new_value),
+            Binop::Div => self.builder.ins().fdiv(orig_value, new_value),
+        };
         self.builder.def_var(*orig_variable, added_val);
-        added_val
+        vec![added_val]
     }
 
-    fn translate_icmp(&mut self, cmp: FloatCC, lhs: Expr, rhs: Expr) -> Value {
+    fn translate_icmp(&mut self, cmp: FloatCC, lhs: &Expr, rhs: &Expr) -> Value {
         let lhs = *self.translate_expr(lhs).first().unwrap();
         let rhs = *self.translate_expr(rhs).first().unwrap();
-        let b = self.builder.ins().fcmp(cmp, lhs, rhs);
-        let c = self.builder.ins().bint(types::I32, b);
-        self.builder.ins().fcvt_from_sint(self.float, c)
+        self.builder.ins().fcmp(cmp, lhs, rhs)
     }
 
-    fn translate_if_then(&mut self, condition: Expr, then_body: Vec<Expr>) -> Value {
-        let condition_value = *self.translate_expr(condition).first().unwrap();
-        //Convert condition from float to bool
-        let zero = self.builder.ins().f64const(0.0);
-        let b_condition_value = self
-            .builder
-            .ins()
-            .fcmp(FloatCC::NotEqual, condition_value, zero);
+    fn translate_if_then(&mut self, condition: &Expr, then_body: &[Expr]) -> Value {
+        let b_condition_value = *self.translate_expr(condition).first().unwrap();
 
         let then_block = self.builder.create_block();
         let merge_block = self.builder.create_block();
@@ -391,33 +466,32 @@ impl<'a> FunctionTranslator<'a> {
         self.builder.switch_to_block(merge_block);
         // We've now seen all the predecessors of the merge block.
         self.builder.seal_block(merge_block);
-        condition_value
+        b_condition_value
     }
 
     fn translate_if_else(
         &mut self,
-        condition: Expr,
-        then_body: Vec<Expr>,
-        else_body: Vec<Expr>,
-    ) -> Value {
-        let condition_value = *self.translate_expr(condition).first().unwrap();
-        //Convert condition from float to bool
-        let zero = self.builder.ins().f64const(0.0);
-        let b_condition_value = self
-            .builder
-            .ins()
-            .fcmp(FloatCC::NotEqual, condition_value, zero);
+        condition: &Expr,
+        then_body: &[Expr],
+        else_body: &[Expr],
+    ) -> Vec<Value> {
+        let b_condition_value = *self.translate_expr(condition).first().unwrap();
 
         let then_block = self.builder.create_block();
         let else_block = self.builder.create_block();
         let merge_block = self.builder.create_block();
 
-        // If-else constructs in the toy language have a return value.
-        // In traditional SSA form, this would produce a PHI between
-        // the then and else bodies. Cranelift uses block parameters,
-        // so set up a parameter in the merge block, and we'll pass
-        // the return values to it from the branches.
-        self.builder.append_block_param(merge_block, self.float);
+        let then_return = self.translate_expr(then_body.last().unwrap());
+        let else_return = self.translate_expr(else_body.last().unwrap());
+
+        for _ in 0..then_return.len() {
+            // If-else constructs in the toy language have a return value.
+            // In traditional SSA form, this would produce a PHI between
+            // the then and else bodies. Cranelift uses block parameters,
+            // so set up a parameter in the merge block, and we'll pass
+            // the return values to it from the branches.
+            self.builder.append_block_param(merge_block, self.float);
+        }
 
         // Test the if condition and conditionally branch.
         self.builder.ins().brz(b_condition_value, else_block, &[]);
@@ -426,23 +500,15 @@ impl<'a> FunctionTranslator<'a> {
 
         self.builder.switch_to_block(then_block);
         self.builder.seal_block(then_block);
-        let mut then_return = self.builder.ins().f64const(0.0);
-        for expr in then_body {
-            then_return = *self.translate_expr(expr).first().unwrap();
-        }
 
         // Jump to the merge block, passing it the block return value.
-        self.builder.ins().jump(merge_block, &[then_return]);
+        self.builder.ins().jump(merge_block, &then_return);
 
         self.builder.switch_to_block(else_block);
         self.builder.seal_block(else_block);
-        let mut else_return = self.builder.ins().f64const(0.0);
-        for expr in else_body {
-            else_return = *self.translate_expr(expr).first().unwrap();
-        }
 
         // Jump to the merge block, passing it the block return value.
-        self.builder.ins().jump(merge_block, &[else_return]);
+        self.builder.ins().jump(merge_block, &else_return);
 
         // Switch to the merge block for subsequent statements.
         self.builder.switch_to_block(merge_block);
@@ -452,12 +518,12 @@ impl<'a> FunctionTranslator<'a> {
 
         // Read the value of the if-else by reading the merge block
         // parameter.
-        let phi = self.builder.block_params(merge_block)[0];
+        let phi = self.builder.block_params(merge_block);
 
-        phi
+        phi.to_vec()
     }
 
-    fn translate_while_loop(&mut self, condition: Expr, loop_body: Vec<Expr>) -> Value {
+    fn translate_while_loop(&mut self, condition: &Expr, loop_body: &[Expr]) -> Value {
         let header_block = self.builder.create_block();
         let body_block = self.builder.create_block();
         let exit_block = self.builder.create_block();
@@ -465,13 +531,7 @@ impl<'a> FunctionTranslator<'a> {
         self.builder.ins().jump(header_block, &[]);
         self.builder.switch_to_block(header_block);
 
-        let condition_value = *self.translate_expr(condition).first().unwrap();
-        //Convert condition from float to bool
-        let zero = self.builder.ins().f64const(0.0);
-        let b_condition_value = self
-            .builder
-            .ins()
-            .fcmp(FloatCC::NotEqual, condition_value, zero);
+        let b_condition_value = *self.translate_expr(condition).first().unwrap();
 
         self.builder.ins().brz(b_condition_value, exit_block, &[]);
         self.builder.ins().jump(body_block, &[]);
@@ -491,20 +551,30 @@ impl<'a> FunctionTranslator<'a> {
         self.builder.seal_block(header_block);
         self.builder.seal_block(exit_block);
 
-        // Just return 0 for now.
-        self.builder.ins().f64const(0.0)
+        b_condition_value
     }
 
-    fn translate_call(&mut self, name: String, args: Vec<Expr>) -> Vec<Value> {
+    fn translate_call(&mut self, name: &str, args: &[Expr]) -> Vec<Value> {
         let mut sig = self.module.make_signature();
 
         // Add a parameter for each argument.
-        for _arg in &args {
+        for _ in args {
             sig.params.push(AbiParam::new(self.float));
         }
 
-        for _ in 0..self.return_counts[&name] {
-            sig.returns.push(AbiParam::new(self.float));
+        if self.return_counts.contains_key(name) {
+            for _ in 0..self.return_counts[name] {
+                sig.returns.push(AbiParam::new(self.float));
+            }
+        } else {
+            match self.translate_std(name, args) {
+                Some(v) => return v,
+                None => {
+                    // If we can't find the function name, maybe it's a libc function.
+                    // For now, assume it will return a float.
+                    sig.returns.push(AbiParam::new(self.float))
+                }
+            }
         }
 
         // TODO: Streamline the API here?
@@ -524,7 +594,7 @@ impl<'a> FunctionTranslator<'a> {
         self.builder.inst_results(call).to_vec()
     }
 
-    fn translate_global_data_addr(&mut self, name: String) -> Value {
+    fn translate_global_data_addr(&mut self, ptr_ty: Type, name: &str) -> Value {
         let sym = self
             .module
             .declare_data(&name, Linkage::Export, true, false)
@@ -532,15 +602,66 @@ impl<'a> FunctionTranslator<'a> {
         let local_id = self
             .module
             .declare_data_in_func(sym, &mut self.builder.func);
+        let global_val = self.builder.create_global_value(GlobalValueData::Load {
+            base: local_id,
+            offset: Offset32::new(0),
+            global_type: ptr_ty,
+            readonly: true,
+        });
 
-        let pointer = self.module.target_config().pointer_type();
-        self.builder.ins().symbol_value(pointer, local_id)
+        //TODO see if this still works with strings like in original toy example
+
+        //self.builder.ins().symbol_value(ptr_ty, local_id)
+        self.builder.ins().global_value(ptr_ty, global_val)
+    }
+
+    fn translate_std(&mut self, name: &str, args: &[Expr]) -> Option<Vec<Value>> {
+        match name {
+            "trunc" => {
+                let v = *self.translate_expr(&args[0]).first().unwrap();
+                Some(vec![self.builder.ins().trunc(v)])
+            }
+            "floor" => {
+                let v = *self.translate_expr(&args[0]).first().unwrap();
+                Some(vec![self.builder.ins().floor(v)])
+            }
+            "ceil" => {
+                let v = *self.translate_expr(&args[0]).first().unwrap();
+                Some(vec![self.builder.ins().ceil(v)])
+            }
+            "fract" => {
+                let v = *self.translate_expr(&args[0]).first().unwrap();
+                let v_int = self.builder.ins().trunc(v);
+                let v = self.builder.ins().fsub(v, v_int);
+                Some(vec![v])
+            }
+            "abs" => {
+                let v = *self.translate_expr(&args[0]).first().unwrap();
+                Some(vec![self.builder.ins().fabs(v)])
+            }
+            "round" => {
+                let v = *self.translate_expr(&args[0]).first().unwrap();
+                Some(vec![self.builder.ins().nearest(v)])
+            }
+            "min" => {
+                let v1 = *self.translate_expr(&args[0]).first().unwrap();
+                let v2 = *self.translate_expr(&args[1]).first().unwrap();
+                Some(vec![self.builder.ins().fmin(v1, v2)])
+            }
+            "max" => {
+                let v1 = *self.translate_expr(&args[0]).first().unwrap();
+                let v2 = *self.translate_expr(&args[1]).first().unwrap();
+                Some(vec![self.builder.ins().fmax(v1, v2)])
+            }
+            _ => None,
+        }
     }
 }
 
 fn declare_variables(
     float: types::Type,
     builder: &mut FunctionBuilder,
+    module: &mut dyn Module,
     params: &[String],
     returns: &[String],
     stmts: &[Expr],
@@ -553,11 +674,22 @@ fn declare_variables(
         // TODO: cranelift_frontend should really have an API to make it easy to set
         // up param variables.
         let val = builder.block_params(entry_block)[i];
-        let var = declare_variable(float, builder, &mut variables, &mut index, name);
+
+        let var = if name.starts_with("&") {
+            declare_variable(
+                module.target_config().pointer_type(),
+                builder,
+                &mut variables,
+                &mut index,
+                name,
+            )
+        } else {
+            declare_variable(float, builder, &mut variables, &mut index, name)
+        };
         builder.def_var(var, val);
     }
 
-    for (_i, name) in returns.iter().enumerate() {
+    for name in returns {
         let zero = builder.ins().f64const(0.0);
         let var = declare_variable(float, builder, &mut variables, &mut index, name);
         //TODO: should we check if there is an input var with the same name and use that instead? (like with params)
@@ -583,7 +715,7 @@ fn declare_variables_in_stmt(
 ) {
     match *expr {
         Expr::Assign(ref names, _) => {
-            for name in names {
+            for name in names.iter() {
                 declare_variable(int, builder, variables, index, name);
             }
         }
