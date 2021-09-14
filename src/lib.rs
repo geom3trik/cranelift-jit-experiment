@@ -2,7 +2,7 @@ use std::mem;
 
 use crate::validator::validate_program;
 
-use crate::frontend::parser;
+pub use crate::frontend::parser;
 
 pub mod frontend;
 pub mod graph;
