@@ -2,11 +2,7 @@ use std::{collections::HashMap, fmt::Debug};
 
 use toposort_scc::IndexGraph;
 
-use crate::{
-    frontend::{make_nonempty, parser, Binop, Cmp, Declaration, Expr},
-    jit,
-    validator::validate_program,
-};
+use crate::{frontend::{Binop, Cmp, Declaration, Expr, NV, make_nonempty, parser}, jit, validator::validate_program};
 
 #[derive(Debug, Clone)]
 pub struct Node {
@@ -120,10 +116,24 @@ fn build_graph_func(
         .unwrap(),
     ));
 
+
+    body.push(Expr::Assign(
+        //vCOUNTER_0 = n
+        make_nonempty(vec!["vCOUNTER_0".to_string()]).unwrap(),
+        //make_nonempty(vec!["n".to_string()]).unwrap(),
+        make_nonempty(vec![
+            Expr::Binop(
+                Binop::Add, 
+                Box::new(Expr::Identifier("n".to_string())), 
+                Box::new(Expr::Identifier("i".to_string()))
+            )
+            ]).unwrap(),
+    ));
+
     for node_idx in &node_execution_order {
         let node = &nodes[*node_idx];
 
-        if &node.func_name == "INPUT" || &node.func_name == "OUTPUT" {
+        if &node.func_name == "INPUT" || &node.func_name == "OUTPUT" || &node.func_name == "COUNTER" {
             continue;
         }
         let node_src_ast = &ast[node_lookup[&node.func_name]];
@@ -209,7 +219,7 @@ fn build_graph_func(
 
     Ok(Declaration {
         name: "graph".to_string(),
-        params: vec!["&audio".to_string()],
+        params: vec!["&audio".to_string(),"n".to_string()],
         returns: vec![],
         body: main_body,
     })

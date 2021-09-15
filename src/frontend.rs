@@ -44,7 +44,7 @@ impl Display for Cmp {
     }
 }
 
-type NV<T> = non_empty_vec::NonEmpty<T>;
+pub type NV<T> = non_empty_vec::NonEmpty<T>;
 
 /// The AST node for expressions.
 #[derive(Debug, Clone)]
